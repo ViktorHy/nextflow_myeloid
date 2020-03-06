@@ -18,12 +18,7 @@ Channel
 Channel
     .fromPath(params.csv).splitCsv(header:true)
     .map{ row-> tuple(row.group, row.id, row.type) }
-    .into { meta_aggregate; meta_germline; meta_pon }
-
-Channel
-    .fromPath(params.csv).splitCsv(header:true)
-    .map{ row-> tuple(row.group, row.type, row.clarity_sample_id, row.clarity_pool_id) }
-    .set { meta_coyote }
+    .set { meta_aggregate }
 
 
 
@@ -39,7 +34,7 @@ Channel
 process bwa_umi {
 	publishDir "${OUTDIR}/bam", mode: 'copy', overwrite: true
 	cpus params.cpu_all
-	memory '128 GB'
+	memory '64 GB'
 	time '2h'
 
 	input:
@@ -47,7 +42,7 @@ process bwa_umi {
 
 	output:
 		set group, id, type, file("${id}.${type}.bwa.umi.sort.bam"), file("${id}.${type}.bwa.umi.sort.bam.bai") into bam_umi_bqsr, bam_umi_confirm
-		set group, id, type, file("${id}.${type}.bwa.sort.bam"), file("${id}.${type}.bwa.sort.bam.bai") into bam_umi_markdup
+		set group, id, type, file("${id}.${type}.bwa.umi.sort.bam"), file("${id}.${type}.bwa.umi.sort.bam.bai"), file("dedup_metrics.txt") into bam_umi_qc
 
 	when:
 		params.umi
@@ -58,7 +53,6 @@ process bwa_umi {
 		-R "@RG\\tID:$id\\tSM:$id\\tLB:$id\\tPL:illumina" \\
 		-t ${task.cpus} \\
 		-p -C $genome_file - \\
-	|tee -a noumi.sam \\
 	|sentieon umi consensus -o consensus.fastq.gz
 
 	sentieon bwa mem \\
@@ -69,9 +63,6 @@ process bwa_umi {
 		-o ${id}.${type}.bwa.umi.sort.bam \\
 		--sam2bam
 
-	sentieon util sort -i noumi.sam -o ${id}.${type}.bwa.sort.bam --sam2bam
-	rm noumi.sam
-
 	touch dedup_metrics.txt
 	"""
 }
@@ -79,6 +70,7 @@ process bwa_umi {
 
 process bwa_align {
 	cpus params.cpu_all
+	publishDir "${OUTDIR}/bam", mode: 'copy', overwrite: true
 	memory '64 GB'
 	time '2h'
 	    
@@ -119,7 +111,7 @@ process markdup {
 	time '1h'
     
 	input:
-		set group, id, type, file(bam), file(bai) from bam_markdup.mix(bam_umi_markdup)
+		set group, id, type, file(bam), file(bai) from bam_markdup
 
 	output:
 		set group, id, type, file("${id}.${type}.dedup.bam"), file("${id}.${type}.dedup.bam.bai") into bam_bqsr
@@ -128,25 +120,21 @@ process markdup {
 	"""
 	sentieon driver -t ${task.cpus} -i $bam --algo LocusCollector --fun score_info score.gz
 	sentieon driver -t ${task.cpus} -i $bam --algo Dedup --score_info score.gz --metrics dedup_metrics.txt ${id}.${type}.dedup.bam
+	sentieon driver -t ${task.cpus} -r $genome_file -i ${id}.${type}.dedup.bam --algo QualCal ${id}.bqsr.table
 	"""
 }
 
-// FIXME: Temporarily broke the non-UMI track since bam_umi_bqsr
-//        and bam_bqsr collide here for UMI track. Figure out how
-//        to use only bam_umi_bqsr when params.umi==true
-process bqsr_umi {
+
+process bqsr {
 	cpus params.cpu_some
 	memory '16 GB'
 	time '1h'
 
 	input:
-		set group, id, type, file(bam), file(bai) from bam_umi_bqsr
+		set group, id, type, file(bam), file(bai) from bam_bqsr.mix(bam_umi_bqsr)
 
 	output:
 		set group, id, type, file(bam), file(bai), file("${id}.bqsr.table") into bam_freebayes, bam_vardict, bam_tnscope, bam_pindel, bam_cnvkit
-
-	when:
-		params.umi
 
 	"""
 	sentieon driver -t ${task.cpus} -r $genome_file -i $bam --algo QualCal ${id}.bqsr.table
@@ -161,7 +149,7 @@ process sentieon_qc {
 	time '1h'
 
 	input:
-		set group, id, type, file(bam), file(bai), file(dedup) from bam_qc
+		set group, id, type, file(bam), file(bai), file(dedup) from bam_qc.mix(bam_umi_qc)
 
 	output:
 		set group, id, type, file("${id}_is_metrics.txt") into insertsize_pindel
@@ -177,9 +165,7 @@ process sentieon_qc {
 	sentieon driver \\
 		-r $genome_file -t ${task.cpus} -i ${bam} \\
 		--algo HsMetricAlgo --targets_list $params.interval_list --baits_list $params.interval_list hs_metrics.txt
-
 	cp is_metrics.txt ${id}_is_metrics.txt
-
 	qc_sentieon.pl ${id}_${type} panel > ${id}_${type}.QC
 	"""
 }
@@ -213,9 +199,7 @@ process freebayes {
 		}
 		else if( mode == "unpaired" ) {
 			"""
-			freebayes -f $genome_file -t $bed --pooled-continuous --pooled-discrete --min-repeat-entropy 1 -F 0.03 $bams > freebayes_${bed}.vcf.raw
-			vcffilter -F LowCov -f "DP > 500" -f "QA > 1500" freebayes_${bed}.vcf.raw | vcffilter -F LowFrq -o -f "AB > 0.05" -f "AB = 0" | vcfglxgt > freebayes_${bed}.filt1.vcf
-			filter_freebayes_unpaired.pl freebayes_${bed}.filt1.vcf > freebayes_${bed}.vcf
+			freebayes -f $genome_file -t $bed --pooled-continuous --pooled-discrete --min-repeat-entropy 1 -F 0.03 $bams > freebayes_${bed}.vcf
 			"""
 		}
 }
@@ -242,7 +226,7 @@ process vardict {
 			normal_idx = type.findIndexOf{ it == 'normal' || it == 'N' }
 
 			"""
-			vardict-java -G $genome_file -f 0.01 -N ${id[tumor_idx]} -b "${bams[tumor_idx]}|${bams[normal_idx]}" -c 1 -S 2 -E 3 -g 4 -U $bed \\
+			vardict-java -G $genome_file -f 0.01 -N ${id[tumor_idx]} -b "${bams[tumor_idx]}|${bams[normal_idx]}" -c 1 -S 2 -E 3 -g 4 $bed \\
 			| testsomatic.R | var2vcf_paired.pl -N "${id[tumor_idx]}|${id[normal_idx]}" -f 0.01 > vardict_${bed}.vcf.raw
 
 			filter_vardict_somatic.pl vardict_${bed}.vcf.raw ${id[tumor_idx]} ${id[normal_idx]} > vardict_${bed}.vcf
@@ -250,8 +234,7 @@ process vardict {
 		}
 		else if( mode == "unpaired" ) {
 			"""
-			vardict-java -G $genome_file -f 0.03 -N ${id[0]} -b ${bams[0]} -c 1 -S 2 -E 3 -g 4 -U $bed | teststrandbias.R | var2vcf_valid.pl -N ${id[0]} -E -f 0.01 > vardict_${bed}.vcf.raw
-			filter_vardict_unpaired.pl vardict_${bed}.vcf.raw > vardict_${bed}.vcf
+			vardict-java -G $genome_file -f 0.03 -N $id -b $bams -c 1 -S 2 -E 3 -g 4 $bed | teststrandbias.R | var2vcf_valid.pl -N $id -E -f 0.01 > vardict_${bed}.vcf
 			"""
 		}
 }
@@ -298,10 +281,8 @@ process tnscope {
 				--interval $bed --algo TNscope \\
 				--tumor_sample ${id[0]} \\
 				--clip_by_minbq 1 --max_error_per_read 3 --min_init_tumor_lod 2.0 \\
-				--min_base_qual 10 --min_base_qual_asm 10 --min_tumor_allele_frac 0.0005 \\
-				tnscope_${bed}.vcf.raw
-
-			filter_tnscope_unpaired.pl tnscope_${bed}.vcf.raw > tnscope_${bed}.vcf
+				--min_base_qual 10 --min_base_qual_asm 10 --min_tumor_allele_frac 0.00005 \\
+				tnscope_${bed}.vcf
 			""" 
 		}
 }
@@ -396,7 +377,7 @@ process cnvkit {
 		set gr, id, type, file(bam), file(bai), file(bqsr), g, vc, file(vcf) from bam_cnvkit.combine(vcf_cnvkit.filter { item -> item[1] == 'freebayes' })
 		
 	output:
-		file("${gr}.${id}.cnvkit.png") into cnvplot_coyote
+		file("${gr}.${id}.cnvkit.png")
 
 	when:
 		params.cnvkit
@@ -421,7 +402,7 @@ process aggregate_vcfs {
 		set g, id, type from meta_aggregate.groupTuple()
 
 	output:
-		set group, file("${group}.agg.vcf") into vcf_pon
+		set group, file("${group}.agg.vcf") into vcf_vep
 
 	script:
 		sample_order = id[0]
@@ -436,30 +417,6 @@ process aggregate_vcfs {
 		"""
 }
 
-process pon_filter {
-	publishDir "${OUTDIR}/vcf", mode: 'copy', overwrite: true
-	cpus 1
-	time '1h'
-
-	input:
-		set group, file(vcf) from vcf_pon
-		set g, id, type from meta_pon.groupTuple()
-
-	output:
-		set group, file("${group}.agg.pon.vcf") into vcf_vep
-
-	script:
-		def pons = []
-		if( params.freebayes ) { pons.push("freebayes="+params.PON_freebayes) }
-		if( params.vardict )   { pons.push("vardict="+params.PON_vardict) }
-		if( params.tnscope )   { pons.push("tnscope="+params.PON_tnscope) }
-		def pons_str = pons.join(",")
-		tumor_idx = type.findIndexOf{ it == 'tumor' || it == 'T' }
-
-	"""
-	filter_with_pon.pl --vcf $vcf --pons $pons_str --tumor-id ${id[tumor_idx]} > ${group}.agg.pon.vcf
-	"""
-}
 
 process annotate_vep {
 	container = '/fs1/resources/containers/container_VEP.sif'
@@ -469,12 +426,12 @@ process annotate_vep {
     
 	input:
 		set group, file(vcf) from vcf_vep
-    
+
 	output:
-		set group, file("${group}.agg.pon.vep.vcf") into vcf_germline
+		set group, file("${group}.vep.vcf") into vcf_umi
 
 	"""
-	vep -i ${vcf} -o ${group}.agg.pon.vep.vcf \\
+	vep -i ${vcf} -o ${group}.vep.vcf \\
 	--offline --merged --everything --vcf --no_stats \\
 	--fork ${task.cpus} \\
 	--force_overwrite \\
@@ -484,34 +441,6 @@ process annotate_vep {
 	--distance 200 \\
 	-cache -custom $params.GNOMAD \\
 	"""
-}
-
-process mark_germlines {
-	publishDir "${OUTDIR}/vcf", mode: 'copy', overwrite: true
-	cpus params.cpu_many
-	time '20m'
-
-	input:
-		set group, file(vcf) from vcf_germline
-		set g, id, type from meta_germline.groupTuple()
-
-	output:
-		set group, file("${group}.agg.pon.vep.markgerm.vcf") into vcf_umi
-
-
-	script:
-		if( mode == "paired" ) {
-			tumor_idx = type.findIndexOf{ it == 'tumor' || it == 'T' }
-			normal_idx = type.findIndexOf{ it == 'normal' || it == 'N' }
-			"""
-			mark_germlines.pl --vcf $vcf --tumor-id ${id[tumor_idx]} --normal-id ${id[normal_idx]} > ${group}.agg.pon.vep.markgerm.vcf
-			"""
-		}
-		else if( mode == "unpaired" ) {
-			"""
-			mark_germlines.pl --vcf $vcf --tumor-id ${id[0]} > ${group}.agg.pon.vep.markgerm.vcf
-			"""
-		}
 }
 
 
@@ -525,7 +454,7 @@ process umi_confirm {
 		set g, id, type, file(bam), file(bai) from bam_umi_confirm.groupTuple()
 
 	output:
-		set group, file("${group}.agg.pon.vep.markgerm.umi.vcf") into vcf_coyote
+		file("${group}.vep.umi.vcf")
 
 
 	when:
@@ -539,7 +468,7 @@ process umi_confirm {
 			"""
 			source activate samtools
 			UMIconfirm_vcf.py ${bam[tumor_idx]} $vcf $genome_file ${id[tumor_idx]} > umitmp.vcf
-			UMIconfirm_vcf.py ${bam[normal_idx]} umitmp.vcf $genome_file ${id[normal_idx]} > ${group}.agg.pon.vep.markgerm.umi.vcf
+			UMIconfirm_vcf.py ${bam[normal_idx]} umitmp.vcf $genome_file ${id[normal_idx]} > ${group}.vep.umi.vcf
 			"""
 		}
 		else if( mode == "unpaired" ) {
@@ -547,29 +476,7 @@ process umi_confirm {
 
 			"""
 			source activate samtools
-			UMIconfirm_vcf.py ${bam[tumor_idx]} $vcf $genome_file ${id[tumor_idx]} > ${group}.agg.pon.vep.markgerm.umi.vcf
+			UMIconfirm_vcf.py ${bam[tumor_idx]} $vcf $genome_file ${id[tumor_idx]} > ${group}.vep.umi.vcf
 			"""
 		}
-}
-
-
-process coyote {
-	publishDir "${params.crondir}/coyote", mode: 'copy', overwrite: true
-	cpus 1
-	time '10m'
-
-	input:
-		set group, file(vcf) from vcf_coyote
-		set g, type, lims_id, pool_id from meta_coyote.groupTuple()
-		file(cnvplot) from cnvplot_coyote
-
-	output:
-		file("${group}.coyote")
-
-	script:
-		tumor_idx = type.findIndexOf{ it == 'tumor' || it == 'T' }
-
-	"""
-	echo "import_myeloid_to_coyote_vep_gms.pl --group myeloid_GMSv1 --vcf /access/myeloid/vcf/${vcf} --id $group --cnv /access/myeloid/plots/${cnvplot} --clarity-sample-id ${lims_id[tumor_idx]} --clarity-pool-id ${pool_id[tumor_idx]}" > ${group}.coyote
-	"""
 }
